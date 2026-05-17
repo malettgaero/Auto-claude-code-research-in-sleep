@@ -75,6 +75,96 @@ fn reasoning_effort() -> String {
         .unwrap_or_else(|| "xhigh".to_string())
 }
 
+/// Number of whole-stream restarts to attempt when chunk read fails (or
+/// returns a premature EOF) before any event has been emitted. Closes
+/// C6 landmine on the OpenAI executor path. Mirrors the same env knob
+/// used by the Anthropic api crate. Default 2, clamped 0..=5. Parses
+/// as u32 first so `ARIS_STREAM_RETRY=999` doesn't silently fall back
+/// to the default (would happen with direct `u8` parse).
+fn stream_retry_budget() -> u8 {
+    let raw = std::env::var("ARIS_STREAM_RETRY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2);
+    raw.min(5) as u8
+}
+
+/// Whether a reqwest::Error from `response.chunk()` represents a
+/// transient mid-body failure that warrants a whole-stream restart.
+fn stream_chunk_error_is_retryable(error: &reqwest::Error) -> bool {
+    error.is_request()
+        || error.is_connect()
+        || error.is_timeout()
+        || error.is_body()
+        || error.is_decode()
+}
+
+/// Re-send the streaming POST when restarting a broken stream. Bounded
+/// inline retry loop covers 429 / 5xx / transient network errors during
+/// the restart — without it, a restart triggered by proxy instability
+/// would immediately fail again if the proxy returns 429 (which is the
+/// most common companion to chunk aborts). 3 attempts max with 1s/2s
+/// backoff between attempts 1→2 and 2→3 (no sleep after the final
+/// attempt). Mirrors the OpenAI executor's primary send-retry semantics.
+async fn stream_restart_send(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    body: &Value,
+) -> Result<reqwest::Response, RuntimeError> {
+    const RESTART_MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        if runtime::is_interrupted() {
+            runtime::clear_interrupt();
+            return Err(RuntimeError::new("interrupted by user"));
+        }
+        let send_result = http
+            .post(url)
+            .bearer_auth(api_key)
+            .header("content-type", "application/json")
+            .json(body)
+            .send()
+            .await;
+        match send_result {
+            Ok(resp) => {
+                let status = resp.status();
+                if resp.status().is_success() {
+                    return Ok(resp);
+                }
+                let retryable = status.as_u16() == 429 || status.is_server_error();
+                if retryable && attempt < RESTART_MAX_ATTEMPTS {
+                    let backoff_ms: u64 = (1u64 << (attempt - 1)) * 1000;
+                    eprintln!(
+                        "\x1b[33m  OpenAI restart {status} (attempt {attempt}/{RESTART_MAX_ATTEMPTS}), retrying in {backoff_ms}ms\x1b[0m"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                let body_preview = resp.text().await.unwrap_or_default();
+                return Err(RuntimeError::new(format!(
+                    "OpenAI stream restart failed: {status}: {body_preview}"
+                )));
+            }
+            Err(e) => {
+                let transient = e.is_timeout() || e.is_connect() || e.is_request() || e.is_body();
+                if transient && attempt < RESTART_MAX_ATTEMPTS {
+                    let backoff_ms: u64 = (1u64 << (attempt - 1)) * 1000;
+                    eprintln!(
+                        "\x1b[33m  OpenAI restart network error (attempt {attempt}/{RESTART_MAX_ATTEMPTS}), retrying in {backoff_ms}ms: {e}\x1b[0m"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+                return Err(RuntimeError::new(format!(
+                    "OpenAI stream restart failed: {e}"
+                )));
+            }
+        }
+    }
+}
+
 /// Resolve executor configuration from environment variables.
 ///
 /// Returns `(api_key, base_url, model)` or `None` if `EXECUTOR_PROVIDER` is not set to `openai`.
@@ -364,6 +454,24 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
 
             let mut stream_buf = String::new();
             let mut done = false;
+            // C6 v0.4.10: whole-stream restart budget for mid-body aborts
+            // or premature EOF before any event has been emitted. See
+            // openai_executor.rs::stream_retry_budget docstring.
+            let mut stream_retries_remaining: u8 = stream_retry_budget();
+            // "Has the caller seen any meaningful output yet?" If true,
+            // we cannot restart — there's no resume primitive in
+            // OpenAI's API and re-sending would duplicate output.
+            let nothing_emitted_yet = |events: &Vec<AssistantEvent>,
+                                       pending_tools: &Vec<(String, String, String)>,
+                                       current_reasoning: &String|
+             -> bool {
+                events.is_empty()
+                    && pending_tools.is_empty()
+                    && current_reasoning.is_empty()
+            };
+            // `[DONE]` sentinel — distinguishes "stream completed normally"
+            // from "proxy closed connection before sending [DONE]".
+            let mut observed_done = false;
 
             loop {
                 // Check for Ctrl+C interrupt between chunks
@@ -371,11 +479,70 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                     runtime::clear_interrupt();
                     return Err(RuntimeError::new("interrupted by user"));
                 }
-                let chunk = response
-                    .chunk()
-                    .await
-                    .map_err(|e: reqwest::Error| RuntimeError::new(e.to_string()))?;
-                let Some(chunk) = chunk else { break };
+                let chunk_result = response.chunk().await;
+                let chunk = match chunk_result {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        // Clean EOF. Three branches:
+                        // 1. Saw [DONE] before EOF → normal completion, break.
+                        // 2. Nothing emitted + retries remain → proxy
+                        //    abort, restart the request.
+                        // 3. Otherwise → truncated stream is a hard
+                        //    failure. Returning Err prevents
+                        //    `Ensure MessageStop` later from synthesizing
+                        //    success out of a half-finished response.
+                        if observed_done {
+                            break;
+                        }
+                        if nothing_emitted_yet(&events, &pending_tools, &current_reasoning)
+                            && stream_retries_remaining > 0
+                        {
+                            stream_retries_remaining -= 1;
+                            eprintln!(
+                                "\x1b[33m  OpenAI stream restart (premature EOF, {} attempt(s) left)\x1b[0m",
+                                stream_retries_remaining
+                            );
+                            response = stream_restart_send(
+                                &self.http,
+                                &url,
+                                &self.api_key,
+                                &body,
+                            )
+                            .await?;
+                            stream_buf.clear();
+                            done = false;
+                            continue;
+                        }
+                        return Err(RuntimeError::new(
+                            "OpenAI stream ended prematurely without [DONE] sentinel \
+                             (retries exhausted or partial output already emitted)"
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        if nothing_emitted_yet(&events, &pending_tools, &current_reasoning)
+                            && stream_retries_remaining > 0
+                            && stream_chunk_error_is_retryable(&error)
+                        {
+                            stream_retries_remaining -= 1;
+                            eprintln!(
+                                "\x1b[33m  OpenAI stream restart (body abort: {error}, {} attempt(s) left)\x1b[0m",
+                                stream_retries_remaining
+                            );
+                            response = stream_restart_send(
+                                &self.http,
+                                &url,
+                                &self.api_key,
+                                &body,
+                            )
+                            .await?;
+                            stream_buf.clear();
+                            done = false;
+                            continue;
+                        }
+                        return Err(RuntimeError::new(error.to_string()));
+                    }
+                };
                 let text = String::from_utf8_lossy(&chunk);
                 stream_buf.push_str(&text);
 
@@ -395,6 +562,7 @@ on a compatible third-party proxy, or use Claude/another provider as executor an
                     };
 
                     if data == "[DONE]" {
+                        observed_done = true;
                         flush_pending_tools(
                             &mut pending_tools,
                             out,

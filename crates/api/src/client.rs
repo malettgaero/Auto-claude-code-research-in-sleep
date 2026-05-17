@@ -229,14 +229,18 @@ impl AnthropicClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageStream, ApiError> {
-        let response = self
-            .send_with_retry(&request.clone().with_streaming())
-            .await?;
+        let streaming_request = request.clone().with_streaming();
+        let response = self.send_with_retry(&streaming_request).await?;
         Ok(MessageStream {
+            inner: self.clone(),
+            request: streaming_request,
             request_id: request_id_from_headers(response.headers()),
             response,
             parser: SseParser::new(),
             pending: VecDeque::new(),
+            events_emitted: 0,
+            stream_retries_remaining: read_stream_retry_budget(),
+            observed_terminal: false,
             done: false,
         })
     }
@@ -597,6 +601,40 @@ pub fn read_send_betas() -> bool {
         .unwrap_or(false)
 }
 
+/// Number of additional whole-stream restarts the SSE reader will attempt
+/// when the body abort or premature EOF occurs before any event was
+/// emitted. v0.4.10 closes the C6 landmine documented in the v0.4.7
+/// audit: stream chunk read failures used to surface directly as
+/// `http error: error decoding response body`, with no retry, even
+/// though the wider request-level retry wrapper (`send_with_retry`)
+/// already exists. Default 2 (clamped 0..=5). Parsed as u32 first so
+/// `ARIS_STREAM_RETRY=999` clamps to 5 instead of silently falling
+/// back to default (would happen with direct u8 parse).
+fn read_stream_retry_budget() -> u8 {
+    let raw = std::env::var("ARIS_STREAM_RETRY")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .unwrap_or(2);
+    raw.min(5) as u8
+}
+
+/// Backoff between stream restarts. Small fixed delay to avoid hammering
+/// a flaky proxy. Independent of the existing send_with_retry backoff,
+/// which already handles the request-send phase.
+const STREAM_RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+/// Whether a reqwest::Error represents a transient stream-body failure
+/// that warrants a whole-stream restart (mid-body abort, decode/framing
+/// interrupted, timeout, connect reset). Excludes HTTP status errors
+/// (those are caught earlier by send_with_retry's expect_success).
+fn stream_chunk_error_is_retryable(error: &reqwest::Error) -> bool {
+    error.is_request()
+        || error.is_connect()
+        || error.is_timeout()
+        || error.is_body()
+        || error.is_decode()
+}
+
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
     headers
         .get(REQUEST_ID_HEADER)
@@ -607,10 +645,30 @@ fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Strin
 
 #[derive(Debug)]
 pub struct MessageStream {
+    /// AnthropicClient handle, cloned at stream creation. Used by
+    /// [`try_refresh_stream`](Self::try_refresh_stream) when a chunk
+    /// read aborts before any event has been emitted. reqwest::Client
+    /// is Arc-wrapped internally so the clone is cheap.
+    inner: AnthropicClient,
+    /// Request body as sent (already had `.with_streaming()` applied).
+    /// Stored verbatim so retries re-send the same payload.
+    request: MessageRequest,
     request_id: Option<String>,
     response: reqwest::Response,
     parser: SseParser,
     pending: VecDeque<StreamEvent>,
+    /// Number of events the caller has already observed via
+    /// [`next_event`](Self::next_event). Zero ⇒ eligible for a
+    /// whole-stream restart on chunk failure or premature EOF.
+    events_emitted: usize,
+    /// Remaining whole-stream restart budget. Initialised from
+    /// `ARIS_STREAM_RETRY` (default 2, clamped 0..=5).
+    stream_retries_remaining: u8,
+    /// `true` once we see Anthropic's `MessageStop` (the protocol's
+    /// terminal event). Combined with `events_emitted == 0` to
+    /// distinguish "proxy aborted before sending anything" from
+    /// "complete short response".
+    observed_terminal: bool,
     done: bool,
 }
 
@@ -634,27 +692,95 @@ impl MessageStream {
                         retryable: false,
                     });
                 }
+                // Track terminal signal + bump emitted counter.
+                if matches!(event, StreamEvent::MessageStop(_)) {
+                    self.observed_terminal = true;
+                }
+                self.events_emitted = self.events_emitted.saturating_add(1);
                 return Ok(Some(event));
             }
 
             if self.done {
-                let remaining = self.parser.finish()?;
+                // Premature EOF retry path: if the server closed the
+                // stream cleanly (no reqwest error) but we never
+                // observed any event AND never saw MessageStop, the
+                // proxy probably aborted upstream. Try a whole-stream
+                // restart before surfacing the parser error or empty
+                // result. Capture finish() instead of `?`-propagating
+                // so a half-parsed JSON tail doesn't bypass the retry.
+                let finish_result = self.parser.finish();
+                let parser_errored = finish_result.is_err();
+                let leftover_empty = finish_result
+                    .as_ref()
+                    .map(Vec::is_empty)
+                    .unwrap_or(false);
+                if self.events_emitted == 0
+                    && !self.observed_terminal
+                    && (parser_errored || leftover_empty)
+                    && self.stream_retries_remaining > 0
+                {
+                    self.stream_retries_remaining -= 1;
+                    eprintln!(
+                        "stream restart (premature EOF, {} attempt(s) left)",
+                        self.stream_retries_remaining
+                    );
+                    self.try_refresh_stream().await?;
+                    continue;
+                }
+                let remaining = finish_result?;
                 self.pending.extend(remaining);
                 if let Some(event) = self.pending.pop_front() {
+                    if matches!(event, StreamEvent::MessageStop(_)) {
+                        self.observed_terminal = true;
+                    }
+                    self.events_emitted = self.events_emitted.saturating_add(1);
                     return Ok(Some(event));
                 }
                 return Ok(None);
             }
 
-            match self.response.chunk().await? {
-                Some(chunk) => {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) => {
                     self.pending.extend(self.parser.push(&chunk)?);
                 }
-                None => {
+                Ok(None) => {
                     self.done = true;
+                }
+                Err(error) => {
+                    // Mid-body abort. Retry the whole request if we
+                    // haven't shown the caller anything yet — there's
+                    // no resume primitive in either upstream API.
+                    if self.events_emitted == 0
+                        && self.stream_retries_remaining > 0
+                        && stream_chunk_error_is_retryable(&error)
+                    {
+                        self.stream_retries_remaining -= 1;
+                        eprintln!(
+                            "stream restart (body abort: {}, {} attempt(s) left)",
+                            error,
+                            self.stream_retries_remaining
+                        );
+                        self.try_refresh_stream().await?;
+                        continue;
+                    }
+                    return Err(ApiError::from(error));
                 }
             }
         }
+    }
+
+    /// Re-sends the original request and rebinds the parser/response
+    /// state. Used only when `next_event` decides the prior stream
+    /// died before any event reached the caller.
+    async fn try_refresh_stream(&mut self) -> Result<(), ApiError> {
+        tokio::time::sleep(STREAM_RETRY_BACKOFF).await;
+        let response = self.inner.send_with_retry(&self.request).await?;
+        self.request_id = request_id_from_headers(response.headers());
+        self.response = response;
+        self.parser = SseParser::new();
+        self.pending.clear();
+        self.done = false;
+        Ok(())
     }
 }
 
