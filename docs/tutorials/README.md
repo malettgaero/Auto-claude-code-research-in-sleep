@@ -9,17 +9,21 @@ Long-form interview-prep cheat sheets, written in Markdown and rendered to singl
 
 ## How they were produced
 
-Each `.md` was rendered via:
+The two pilots were drafted by hand and rendered via `/render-html`. Subsequent tutorials use the dedicated workflow skill:
 
-```bash
-python3 skills/render-html/scripts/render_html.py <tutorial>.md \
-  --template academic \
-  --author "Ruofeng Yang (杨若峰), Shanghai Jiao Tong University" \
-  --eyebrow "Interview Prep · …" \
-  --subtitle "…" \
-  --title "…"
+```
+/interview-cheatsheet "<TOPIC>"            # default: 600-line balanced effort
+/interview-cheatsheet "<TOPIC>" — effort: max    # ~1000 lines + deeper proofs
 ```
 
-After rendering, a fresh-thread `codex gpt-5.5 xhigh` review checked 13 properties — information fidelity, math/code/table integrity, callout class mapping, `<details>` inner Markdown rendering, sanitization, no path/personal-info leakage, TOC link resolution, heading glue. The per-file audit trail is in `*.review.json`.
+`/interview-cheatsheet` ([`skills/interview-cheatsheet/SKILL.md`](../../skills/interview-cheatsheet/SKILL.md)) is an ARIS skill that:
 
-> See [`skills/render-html/SKILL.md`](../../skills/render-html/SKILL.md) for the full skill protocol.
+1. Plans a 12-14 section structure (TL;DR · intuition · formula+derivation · from-scratch PyTorch · variants · 25 高频面试题 L1/L2/L3)
+2. Drafts the MD following the canonical style of the two pilot tutorials (heading conventions, table-pipe escapes, callout-list separation rules — all bugs caught during the pilot reviews are now encoded into the style guide)
+3. Cross-model `codex gpt-5.5 xhigh` review on math / code / interview-answer / citation correctness + personal-info redaction (fresh thread, never `codex-reply`)
+4. Fix-and-loop up to 3 rounds
+5. Renders via `/render-html` (which itself runs a 13-check codex review on the rendered output)
+6. Writes a combined audit trail to `*.review.json`
+7. **Stops — never auto-commits.** The user reviews and pushes manually.
+
+> See [`skills/interview-cheatsheet/SKILL.md`](../../skills/interview-cheatsheet/SKILL.md) for the full skill protocol and [`skills/render-html/SKILL.md`](../../skills/render-html/SKILL.md) for the renderer.
